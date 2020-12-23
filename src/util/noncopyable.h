@@ -11,6 +11,8 @@ public:
 protected:
   Noncopyable() = default;
   ~Noncopyable() = default;
+  Noncopyable(Noncopyable&&) = default;
+  Noncopyable& operator=(Noncopyable&&) = default;
 };
 
 } // namespace hearten
