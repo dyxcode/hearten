@@ -9,7 +9,8 @@ set(CMAKE_CXX_FLAGS "$ENV{CPPFLAGS} -O3 -g -std=c++17 -Wall -Wno-deprecated -Wer
 
 include_directories(${PROJECT_SOURCE_DIR}/src)
 
-add_executable(mytest tests/main.cpp)
+add_executable(test_db tests/test_db.cc)
+add_executable(test_json tests/test_json.cc)
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
 
