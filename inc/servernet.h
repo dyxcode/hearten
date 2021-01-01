@@ -1,5 +1,5 @@
-#ifndef HEARTEN_SOCKET_SERVERNET_H_
-#define HEARTEN_SOCKET_SERVERNET_H_
+#ifndef HEARTEN_SERVERNET_H_
+#define HEARTEN_SERVERNET_H_
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -14,8 +14,7 @@
 #include <memory>
 #include <unordered_map>
 
-#include "schedule/ioeventloop.h"
-#include "util/util.h"
+#include "ioeventloop.h"
 
 namespace hearten {
 
@@ -370,12 +369,12 @@ private:
 
 } // namespace detail
 
-class ServerNet : Noncopyable {
+class ServerNet : detail::Noncopyable {
   using ConnectionCallback = detail::Connection::ConnectionCallback;
   using MessageCallback = detail::Connection::MessageCallback;
 public:
-  explicit ServerNet(const detail::IPv4Addr& listen_addr, IOEventLoop& loop)
-    : loop_(loop), acceptor_(listen_addr, loop) {
+  explicit ServerNet(const detail::IPv4Addr& listen_addr)
+    : acceptor_(listen_addr, loop_) {
     acceptor_.setNewConnetionCallback([this](detail::Socket socket) {
         newConnection(std::move(socket));
     });
@@ -389,6 +388,7 @@ public:
   void start() {
     INFO << "TcpServer start...";
     acceptor_.listen();
+    loop_.loop();
   }
 
   ServerNet& setConnectionCallback(ConnectionCallback cb)
@@ -409,7 +409,7 @@ private:
                 .connectionEstablished();
   }
 
-  IOEventLoop& loop_;
+  IOEventLoop loop_;
   detail::Acceptor acceptor_;
   std::unordered_map<int, detail::Connection> connections_;
   ConnectionCallback connection_cb_;

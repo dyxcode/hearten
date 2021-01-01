@@ -1,12 +1,12 @@
-#ifndef HEARTEN_BITCASK_BITCASKDB_H_
-#define HEARTEN_BITCASK_BITCASKDB_H_
+#ifndef HEARTEN_BITCASKDB_H_
+#define HEARTEN_BITCASKDB_H_
 
 #include <string>
 #include <unordered_map>
 #include <optional>
 #include <filesystem>
 
-#include "log/log.h"
+#include "log.h"
 
 namespace hearten {
 
@@ -56,8 +56,8 @@ public:
     return static_cast<uint32_t>(offset);
   }
 
-  const std::string& key() const { return key_; }
-  const std::string& value() const { return value_; }
+  std::string key() const { return key_; }
+  std::string value() const { return value_; }
 
 private:
   std::string key_;

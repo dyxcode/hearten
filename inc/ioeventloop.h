@@ -1,5 +1,5 @@
-#ifndef HEARTEN_SCHEDULE_IOEVENTLOOP_H_
-#define HEARTEN_SCHEDULE_IOEVENTLOOP_H_
+#ifndef HEARTEN_IOEVENTLOOP_H_
+#define HEARTEN_IOEVENTLOOP_H_
 
 #include <unistd.h>
 #include <sys/epoll.h>
@@ -7,14 +7,13 @@
 #include <vector>
 #include <unordered_set>
 
-#include "util/util.h"
-#include "log/log.h"
+#include "log.h"
 
 namespace hearten {
 
 namespace detail {
 
-class Channel : public Noncopyable {
+class Channel : Noncopyable {
   static constexpr int kNoneEvent = 0;
   static constexpr int kReadEvent = EPOLLIN | EPOLLPRI;
   static constexpr int kWriteEvent = EPOLLOUT;
@@ -67,7 +66,7 @@ private:
 
 } // namespace detail
 
-class IOEventLoop : public Noncopyable {
+class IOEventLoop : detail::Noncopyable {
   static constexpr size_t kInitSize = 16;
 public:
   IOEventLoop() : epfd_(::epoll_create1(EPOLL_CLOEXEC)), events_(kInitSize) {

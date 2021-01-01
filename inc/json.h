@@ -1,16 +1,16 @@
-#ifndef HEARTEN_JSON_JSON_H_
-#define HEARTEN_JSON_JSON_H_
+#ifndef HEARTEN_JSON_H_
+#define HEARTEN_JSON_H_
 
 #include <vector>
 #include <string>
 #include <unordered_map>
 #include <variant>
 
-#include "log/log.h"
+#include "log.h"
 
 namespace hearten {
 
-  namespace detail {
+namespace detail {
 
 inline std::string_view skipSpace(std::string_view src) {
   src.remove_prefix(std::min(src.find_first_not_of(" \t\n"), src.size()));
@@ -165,7 +165,6 @@ struct JsonNode {
   NodeType data_;
 };
 
-
 } // namespace detail
 
 class Json {
@@ -179,7 +178,7 @@ public:
   }
   std::string toString() const { return node_.stringify(); }
 
-  operator detail::JsonNode::NodeType() const { return node_.data_; }
+  operator detail::JsonNode::NodeType&() { return node_.data_; }
 
 private:
   detail::JsonNode node_;
