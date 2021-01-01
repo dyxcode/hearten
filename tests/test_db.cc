@@ -7,7 +7,7 @@
 #include <map>
 #include <chrono>
 
-#include "bitcask/bitcaskdb.h"
+#include "bitcaskdb.h"
 
 std::string random_string( size_t length ) {
   auto randchar = []() -> char {

@@ -1,4 +1,5 @@
-#pragma once
+#ifndef HEARTEN_THREADPOOL_H_
+#define HEARTEN_THREADPOOL_H_
 
 #include <map>
 #include <list>
@@ -179,3 +180,5 @@ private:
 };
 
 } // namespace hearten
+
+#endif

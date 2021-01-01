@@ -1,12 +1,12 @@
-#ifndef HEARTEN_HTTP_HTTP_H_
-#define HEARTEN_HTTP_HTTP_H_
+#ifndef HEARTEN_HTTP_H_
+#define HEARTEN_HTTP_H_
 
 #include <string>
 #include <unordered_map>
 #include <sstream>
 #include <iostream>
 
-#include "socket/servernet.h"
+#include "servernet.h"
 
 namespace hearten {
 
@@ -82,7 +82,7 @@ std::string descript(int status) {
   }
 }
 
-std::string filetype(const std::string& file) {
+std::string filetype(std::string_view file) {
   if (file == ".css") return "text/css; charset=utf-8";
   if (file == ".js") return "application/x-javascript; charset=utf-8";
   if (file == ".jpg") return "application/x-jpg";
@@ -219,11 +219,9 @@ public:
   }
   template<typename Ip>
   void listen(Ip&& ip, uint16_t port) {
-    IOEventLoop loop;
-    ServerNet server{detail::IPv4Addr(std::forward<Ip>(ip), port), loop};
+    ServerNet server{detail::IPv4Addr(std::forward<Ip>(ip), port)};
     server.setMessageCallback([this](auto handle) { onMessage(handle); });
     server.start();
-    loop.loop();
   }
 
 private:
@@ -255,7 +253,7 @@ private:
     }
     handle.shutdown();
   }
-  Method toMethodEnum(const std::string& method) {
+  Method toMethodEnum(std::string_view method) {
     if (method == "POST") return POST;
     if (method == "PUT") return PUT;
     if (method == "DELETE") return DELETE;

@@ -1,4 +1,4 @@
-#include "json/json.h"
+#include "json.h"
 
 int main() {
   hearten::Json json;
