@@ -169,12 +169,9 @@ private:
   detail::HashListQueue<size_t> scheduler_;
 };
 
-
 class Channel : Noncopyable {
-  static constexpr int kReadEvent = EPOLLIN | EPOLLPRI;
-  static constexpr int kWriteEvent = EPOLLOUT;
 public:
-  Channel(int fd) : events_(-1) { }
+  Channel() : isListen(false), events_(0) { }
 
   void handleEvent(int revents) {
     if ((revents & EPOLLHUP) && !(revents & EPOLLIN) && close_cb_)
@@ -196,17 +193,19 @@ public:
   Channel& setCloseCallback(std::function<void()> cb)
   { close_cb_ = std::move(cb); return *this; }
 
-  void enableReading() { events_ |= kReadEvent; }
-  void enableWriting() { events_ |= kWriteEvent; }
-  void disableWrting() { events_ &= ~kWriteEvent; }
-  void disableAll()    { events_ = 0; }
-
-  bool isNoneEvent() const { return events_ == 0; }
-  bool isWriting() const { return events_ & kWriteEvent; }
   int getEvents() const { return events_; }
-  bool isNewAndSetOld() { return events_++; }
+  void setEvents(int flag) { events_ |= flag; }
+  void unsetEvents(int flag) { events_ &= ~flag; }
+  bool checkEvents(int flag) {
+    if (flag == 0) return events_ == 0;
+    return (events_ & flag) == flag;
+  }
+
+  bool getState() const { return state_; }
+  void setState(bool state) { state_ = state; }
 
 private:
+  bool state_;
   int events_;
   std::function<void()> read_cb_;
   std::function<void()> write_cb_;
@@ -224,6 +223,33 @@ public:
   }
   ~Epoller() {
     ASSERT(::close(epfd_) != -1);
+  }
+
+  Channel& get(int fd) { return channels_[fd]; }
+
+  void set(int fd, Channel& channel) {
+    if (channel.state()) {
+      // check is none event
+      if (channel.checkEvents(0)) return;
+      channel.setOld();
+      updateEpollEvent(EPOLL_CTL_ADD, fd, channel);
+    } else {
+      // existed channel
+      if (channel.checkEvents(0)) {
+        channel.set()
+        updateEpollEvent(EPOLL_CTL_DEL, fd, channel);
+      } else {
+        updateEpollEvent(EPOLL_CTL_MOD, fd, channel);
+      }
+    }
+  }
+
+  void updateEpollEvent(int operation, int fd, Channel& channel) {
+    epoll_event ev;
+    ::memset(&ev, 0, sizeof(ev));
+    ev.events = channel.getEvents();
+    ev.data.ptr = &channel;
+    ASSERT(::epoll_ctl(epfd_, operation, fd, &ev) == 0);
   }
 
   void setTimeout(int timeout) {
@@ -281,7 +307,62 @@ private:
 
 } // namespace detail
 
-template<size_t ThreadNumber>
+enum class IO : int {
+  // for epoll event and callback
+  kRead = EPOLLIN | EPOLLPRI,
+  kWrite = EPOLLOUT,
+  // only for callback
+  kError = 1 << 8,
+  kClose = 1 << 9,
+  // only for epoll event
+  kAll = kRead | kWrite,
+  kNone = 0
+};
+
+template<size_t EventListSize>
+class IOHandle : detail::Noncopyable {
+  using Epoller = detail::Epoller<EventListSize>;
+public:
+  IOHandle(int fd, detail::Channel& channel, Epoller& epoller)
+    : fd_(fd), channel_(channel), epoller_(epoller) { }
+
+  void open(IO flag) {
+    if (isEpollEvent(flag)) {
+      channel_.setEvents(static_cast<int>(flag));
+      epoller_.setChannel(channel_);
+    }
+  }
+  void close(IO flag) {
+    if (isEpollEvent(flag)) {
+      channel_.unsetEvents(static_cast<int>(flag));
+      epoller_.setChannel(channel_);
+    }
+  }
+  void check(IO flag) {
+    if (isEpollEvent(flag))
+      channel_.checkEvents(static_cast<int>(flag));
+  }
+  void set(IO flag, std::function<void()> cb) {
+    switch (flag) {
+      case IO::kRead : channel_.setReadCallback(std::move(cb)); break;
+      case IO::kWrite : channel_.setWriteCallback(std::move(cb)); break;
+      case IO::kError : channel_.setErrorCallback(std::move(cb)); break;
+      case IO::kClose : channel_.setCloseCallback(std::move(cb)); break;
+      default : break;
+    }
+  }
+
+private:
+  bool isEpollEvent(IO flag) {
+    return !(flag == IO::kError || flag == IO::kClose);
+  }
+
+  int fd_;
+  detail::Channel& channel_;
+  Epoller& epoller_;
+};
+
+template<size_t ThreadNumber, size_t EventListSize>
 class Processor : detail::Noncopyable {
   using TimePoint = typename std::chrono::steady_clock::time_point;
   using Duration = typename std::chrono::steady_clock::duration;
@@ -289,57 +370,17 @@ class Processor : detail::Noncopyable {
 public:
   Processor() {}
 
-  void run() {
-    while (true) {
-    }
+  IOHandle<EventListSize> io(int fd) {
+    return {epoller.channel(fd)};
   }
 
-  detail::Channel& registerChannel(int fd) {
-    auto [iter, success] = channels_.try_emplace(fd, fd);
-    ASSERT(success);
-    return iter->second;
-  }
-
-  detail::Channel& searchChannel(int fd) {
-    auto iter = channels_.find(fd);
-    ASSERT(iter != channels_.end());
-    return iter->second;
-  }
-
-  void updateChannel(detail::Channel& channel) {
-    if (channel.isNewAndSetOld()) {
-      // a new channel
-      ASSERT(!channel.isNoneEvent());
-      updateEpollEvent(EPOLL_CTL_ADD, channel);
-      DEBUG << "add channel: " << channel.getFd();
-    } else {
-      // existed channel
-      if (channel.isNoneEvent()) {
-        DEBUG << "delete channel: " << channel.getFd();
-        updateEpollEvent(EPOLL_CTL_DEL, channel);
-        size_t n = channels_.erase(channel.getFd());
-        ASSERT(n == 1);
-      } else {
-        DEBUG << "modify channel: " << channel.getFd();
-        updateEpollEvent(EPOLL_CTL_MOD, channel);
-      }
-    }
-  }
 
 private:
-  void updateEpollEvent(int operation, detail::Channel& channel) {
-    epoll_event ev;
-    ::memset(&ev, 0, sizeof(ev));
-    ev.events = channel.getEvents();
-    ev.data.ptr = &channel;
-    int fd = channel.getFd();
-    ASSERT(::epoll_ctl(epfd_, operation, fd, &ev) == 0);
-  }
-
   bool stop_;
   size_t waiting_for_delay_task_;
   std::multimap<TimePoint, detail::PeriodicTask> tasks_;
   std::vector<std::thread> threads_;
+  detail::Epoller<EventListSize> epoller;
 };
 
 } // namespace hearten
