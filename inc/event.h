@@ -18,11 +18,24 @@
 
 namespace hearten {
 
+enum class IO : int {
+  // for epoll event and callback
+  kRead = EPOLLIN | EPOLLPRI,
+  kWrite = EPOLLOUT,
+  // only for callback
+  kError = 1 << 8,
+  kClose = 1 << 9,
+  // only for epoll event
+  kAll = kRead | kWrite,
+  kNone = 0
+};
+
 namespace detail {
 
+template<typename Clock>
 class PeriodicTask {
-  using Period = typename std::chrono::steady_clock::duration;
-  using TimePoint = typename std::chrono::steady_clock::time_point;
+  using Period = typename Clock::duration;
+  using TimePoint = typename Clock::time_point;
 public:
   template<typename T>
   PeriodicTask(T&& task, const Period& period, int times)
@@ -74,43 +87,45 @@ private:
   std::list<T> nodes_;
 };
 
-class ThreadPool {
-  using TimePoint = typename std::chrono::steady_clock::time_point;
-  using Duration = typename std::chrono::steady_clock::duration;
+template<typename Clock, size_t ThreadNumber>
+class Scheduler : Noncopyable {
+  using TimePoint = typename Clock::time_point;
+  using Duration = typename Clock::duration;
+  using PeriodicTask = PeriodicTask<Clock>;
+  using Iter = typename std::multimap<TimePoint, PeriodicTask>::iterator;
 public:
-  explicit ThreadPool(size_t thread_num)
-    : stop_(false), waiting_for_delay_task_(thread_num), cvs_(thread_num) {
-    while (thread_num--) {
-      threads_.emplace_back([index = thread_num, this]{
+  Scheduler()
+    : stop_(false), delay_wake_up_thread_(0), cvs_(ThreadNumber) {
+    for (size_t i = 1; i <= ThreadNumber; ++i) {
+      threads_.emplace_back([i, this]{
         std::unique_lock<std::mutex> u_lock{mtx_};
         while (true) {
           if (stop_) break;
-          if (tasks_.empty() || waiting_for_delay_task_ != threads_.size()) {
-            scheduler_.put(index);
-            cvs_[index].wait(u_lock);
-            scheduler_.remove(index);
+          if (tasks_.empty() || delay_wake_up_thread_ != threads_.size()) {
+            orders_.put(i);
+            cvs_[i].wait(u_lock);
+            orders_.remove(i);
           } else {
             auto && execute_time = tasks_.begin()->first;
             if (execute_time <= Clock::now()) {
               auto map_node = tasks_.extract(tasks_.begin());
-              if (!tasks_.empty() && !scheduler_.empty())
-                cvs_[scheduler_.get()].notify_one();
-              PeriodicTask& task = map_node.mapped();
+              if (!tasks_.empty() && !orders_.empty())
+                cvs_[orders_.get()].notify_one();
+              auto& task = map_node.mapped();
               task(map_node, tasks_, u_lock);
             } else {
-              scheduler_.put(index);
-              waiting_for_delay_task_ = index;
-              cvs_[index].wait_until(u_lock, execute_time);
-              waiting_for_delay_task_ = threads_.size();
-              scheduler_.remove(index);
+              orders_.put(i);
+              delay_wake_up_thread_ = i;
+              cvs_[i].wait_until(u_lock, execute_time);
+              delay_wake_up_thread_ = threads_.size();
+              orders_.remove(i);
             }
           }
         }
       });
     }
   }
-
-  ~ThreadPool() {
+  ~Scheduler() {
     {
       std::lock_guard<std::mutex> guard{mtx_};
       stop_ = true;
@@ -121,57 +136,72 @@ public:
       item.join();
   }
 
-  ThreadPool(const ThreadPool&) = delete;
-  ThreadPool& operator=(const ThreadPool&) = delete;
-
   template<typename F>
   auto execute(F&& task,
-               const TimePoint& execute_time = Clock::now(),
+               const TimePoint& execute_time,
                const Duration& period = Duration::zero(),
                int times = 1) {
-    return addTask(execute_time,
-                   PeriodicTask(std::forward<F>(task), period, times));
-  }
-
-  template<typename F>
-  auto execute(F&& task,
-               const Duration& delay,
-               const Duration& period = Duration::zero(),
-               int times = 1) {
-    return addTask(Clock::now() + delay,
-                   PeriodicTask(std::forward<F>(task), period, times));
-  }
-
-private:
-  void addTask(const TimePoint& execute_time, PeriodicTask&& task) {
+    auto end_time = task.getEndTime(execute_time);
     size_t index;
-    typename std::multimap<TimePoint, PeriodicTask>::iterator iter;
     {
       std::lock_guard<std::mutex> guard{mtx_};
-      iter = tasks_.emplace(execute_time, std::move(task));
-      if (scheduler_.empty())
+      auto iter = tasks_.emplace(execute_time, std::move(task));
+      if (orders_.empty())
         index = cvs_.size();
+      else if (delay_wake_up_thread_ == cvs_.size())
+        index = orders_.get();
       else
-        index = (waiting_for_delay_task_ == cvs_.size() ?
-                 scheduler_.get() : waiting_for_delay_task_);
+        index = delay_wake_up_thread_;
     }
     if (index != cvs_.size())
       cvs_[index].notify_one();
+    return [callable = true, end_time, iter, this] () mutable {
+      if (callable == false) return;
+      std::unique_lock<std::mutex> u_lock{mtx_};
+      if (end_time < Clock::now()) return;
+      size_t index = delay_wake_up_thread_;
+      bool need_notify = (iter == tasks_.begin())
+                        && (index != cvs_.size());
+      tasks_.erase(iter);
+      u_lock.unlock();
+      if (need_notify)
+        cvs_[index].notify_one();
+      callable = false;
+
+    };
   }
 
 private:
   bool stop_;
-  size_t waiting_for_delay_task_;
+  size_t delay_wake_up_thread_;
   std::mutex mtx_;
-  std::multimap<TimePoint, PeriodicTask> tasks_;
   std::vector<std::condition_variable> cvs_;
   std::vector<std::thread> threads_;
-  detail::HashListQueue<size_t> scheduler_;
+  std::multimap<TimePoint, PeriodicTask> tasks_;
+  HashListQueue<size_t> orders_;
+};
+
+template<typename Clock>
+class TimerHandle : Noncopyable {
+  using TimePoint = typename Clock::time_point;
+  using Duration = typename Clock::duration;
+public:
+  TimerHandle(std::function<void()> task,
+      const TimePoint& execute_time,
+      const Duration& period,
+      int times)
+  void cancel() {
+  }
+  void reset();
+
+private:
+  std::mutex& mtx_;
+  std::multimap<TimePoint, PeriodicTask<Clock>>& tasks_;
 };
 
 class Channel : Noncopyable {
 public:
-  Channel() : isListen(false), events_(0) { }
+  Channel() : events_(0) { }
 
   void handleEvent(int revents) {
     if ((revents & EPOLLHUP) && !(revents & EPOLLIN) && close_cb_)
@@ -201,11 +231,7 @@ public:
     return (events_ & flag) == flag;
   }
 
-  bool getState() const { return state_; }
-  void setState(bool state) { state_ = state; }
-
 private:
-  bool state_;
   int events_;
   std::function<void()> read_cb_;
   std::function<void()> write_cb_;
@@ -225,31 +251,22 @@ public:
     ASSERT(::close(epfd_) != -1);
   }
 
-  Channel& get(int fd) { return channels_[fd]; }
-
-  void set(int fd, Channel& channel) {
-    if (channel.state()) {
+  void monitor(int fd, Channel& channel) {
+    auto iter = fds_.find(fd);
+    if (iter == fds_.end()) {
       // check is none event
       if (channel.checkEvents(0)) return;
-      channel.setOld();
+      fds_.emplace(fd);
       updateEpollEvent(EPOLL_CTL_ADD, fd, channel);
     } else {
       // existed channel
       if (channel.checkEvents(0)) {
-        channel.set()
+        fds_.emplace(iter);
         updateEpollEvent(EPOLL_CTL_DEL, fd, channel);
       } else {
         updateEpollEvent(EPOLL_CTL_MOD, fd, channel);
       }
     }
-  }
-
-  void updateEpollEvent(int operation, int fd, Channel& channel) {
-    epoll_event ev;
-    ::memset(&ev, 0, sizeof(ev));
-    ev.events = channel.getEvents();
-    ev.data.ptr = &channel;
-    ASSERT(::epoll_ctl(epfd_, operation, fd, &ev) == 0);
   }
 
   void setTimeout(int timeout) {
@@ -263,7 +280,7 @@ public:
       ASSERT(n <= events_.size());
       // execute events callback
       for (int i = 0; i < n; ++i) {
-        auto channel = static_cast<detail::Channel*>(events_[i].data.ptr);
+        auto channel = static_cast<Channel*>(events_[i].data.ptr);
         channel->handleEvent(events_[i].events);
       }
       // resizing the eventlist
@@ -275,67 +292,35 @@ public:
   }
 
 private:
+  void updateEpollEvent(int operation, int fd, Channel& channel) {
+    epoll_event ev;
+    ::memset(&ev, 0, sizeof(ev));
+    ev.events = channel.getEvents();
+    ev.data.ptr = &channel;
+    ASSERT(::epoll_ctl(epfd_, operation, fd, &ev) == 0);
+  }
+
   int epfd_;
+  std::unordered_set<int> fds_;
   std::vector<epoll_event> events_;
-  std::unordered_map<int, Channel> channels_;
-};
-
-template<size_t ThreadNumber>
-class Scheduler : Noncopyable {
-public:
-  Scheduler()
-    : delay_wake_up_thread_(ThreadNumber) {
-  }
-  ~Scheduler() {
-    {
-      std::lock_guard<std::mutex> guard{mtx_};
-      stop_ = true;
-    }
-    for (auto && item : cvs_)
-      item.notify_one();
-    for (auto && item : threads_)
-      item.join();
-  }
-
-private:
-  size_t delay_wake_up_thread_;
-  std::mutex mtx_;
-  std::vector<std::condition_variable> cvs_;
-  std::vector<std::thread> threads_;
-  HashListQueue<size_t> worker_queue_;
-};
-
-} // namespace detail
-
-enum class IO : int {
-  // for epoll event and callback
-  kRead = EPOLLIN | EPOLLPRI,
-  kWrite = EPOLLOUT,
-  // only for callback
-  kError = 1 << 8,
-  kClose = 1 << 9,
-  // only for epoll event
-  kAll = kRead | kWrite,
-  kNone = 0
 };
 
 template<size_t EventListSize>
-class IOHandle : detail::Noncopyable {
-  using Epoller = detail::Epoller<EventListSize>;
+class IOHandle : Noncopyable {
+  using Epoller = Epoller<EventListSize>;
 public:
-  IOHandle(int fd, detail::Channel& channel, Epoller& epoller)
-    : fd_(fd), channel_(channel), epoller_(epoller) { }
+  IOHandle(int fd, Epoller& epoller) : fd_(fd), epoller_(epoller) { }
 
   void open(IO flag) {
     if (isEpollEvent(flag)) {
       channel_.setEvents(static_cast<int>(flag));
-      epoller_.setChannel(channel_);
+      epoller_.monitor(fd_, channel_);
     }
   }
   void close(IO flag) {
     if (isEpollEvent(flag)) {
       channel_.unsetEvents(static_cast<int>(flag));
-      epoller_.setChannel(channel_);
+      epoller_.monitor(fd_, channel_);
     }
   }
   void check(IO flag) {
@@ -358,29 +343,35 @@ private:
   }
 
   int fd_;
-  detail::Channel& channel_;
+  Channel channel_;
   Epoller& epoller_;
 };
 
-template<size_t ThreadNumber, size_t EventListSize>
-class Processor : detail::Noncopyable {
-  using TimePoint = typename std::chrono::steady_clock::time_point;
-  using Duration = typename std::chrono::steady_clock::duration;
+} // namespace detail
 
+template<typename Clock, size_t ThreadNumber, size_t EventListSize>
+class Processor : detail::Noncopyable {
+  using TimePoint = typename Clock::time_point;
+  using Duration = typename Clock::duration;
 public:
   Processor() {}
 
-  IOHandle<EventListSize> io(int fd) {
-    return {epoller.channel(fd)};
+  detail::IOHandle<EventListSize> io(int fd) {
+    return detail::IOHandle<EventListSize>(fd, epoller_);
   }
 
+  detail::TimerHandle<Clock> timer(std::function<void()> task,
+          const TimePoint& execute_time = Clock::now(),
+          const Duration& period = Duration::zero(),
+          int times = 1) {
+    return detail::TimerHandle<Clock>
+      (std::move(task), execute_time, period, times);
+  }
 
 private:
   bool stop_;
-  size_t waiting_for_delay_task_;
-  std::multimap<TimePoint, detail::PeriodicTask> tasks_;
-  std::vector<std::thread> threads_;
-  detail::Epoller<EventListSize> epoller;
+  detail::Epoller<EventListSize> epoller_;
+  detail::Scheduler<Clock, ThreadNumber> scheduler_;
 };
 
 } // namespace hearten
