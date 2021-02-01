@@ -32,40 +32,6 @@ enum class IO : int {
 
 namespace detail {
 
-template<typename Clock>
-class PeriodicTask {
-  using Period = typename Clock::duration;
-  using TimePoint = typename Clock::time_point;
-public:
-  template<typename T>
-  PeriodicTask(T&& task, const Period& period, int times)
-    : task_(std::forward<T>(task)), period_(period), times_(times) { }
-
-  template<typename T, typename C, typename U>
-  void operator()(T&& map_node, C& container, U& u_lock) {
-    if (--times_ >= 0) {
-      if (times_ != 0) {
-        map_node.key() += period_;
-        container.insert(std::move(map_node));
-      }
-      u_lock.unlock();
-      task_();
-      u_lock.lock();
-    }
-  }
-  TimePoint getEndTime(const TimePoint& execute_time) const {
-    return execute_time + period_ * times_;
-  }
-
-  PeriodicTask(const PeriodicTask&) = delete;
-  PeriodicTask(PeriodicTask&&) = default;
-
-private:
-  std::function<void()> task_;
-  Period period_;
-  int times_;
-};
-
 template<typename T>
 class HashListQueue {
 public:
@@ -87,37 +53,76 @@ private:
   std::list<T> nodes_;
 };
 
+template<typename Clock>
+class Task {
+  using Period = typename Clock::duration;
+  using TimePoint = typename Clock::time_point;
+public:
+  template<typename T>
+  Task(T&& task, const Period& period, int times)
+    : task_(std::forward<T>(task)), period_(period), times_(times) { }
+
+  template<typename T, typename C, typename U>
+  void operator()(T&& map_node, C& container, U& u_lock) {
+    if (--times_ >= 0) {
+      if (times_ != 0) {
+        map_node.key() += period_;
+        container.insert(std::move(map_node));
+      }
+      u_lock.unlock();
+      task_();
+      u_lock.lock();
+    }
+  }
+  TimePoint getEndTime(const TimePoint& execute_time) const {
+    return execute_time + period_ * times_;
+  }
+
+  Task(const Task&) = delete;
+  Task(Task&&) = default;
+
+private:
+  std::function<void()> task_;
+  Period period_;
+  int times_;
+};
+
 template<typename Clock, size_t ThreadNumber>
 class Scheduler : Noncopyable {
   using TimePoint = typename Clock::time_point;
   using Duration = typename Clock::duration;
-  using PeriodicTask = PeriodicTask<Clock>;
-  using Iter = typename std::multimap<TimePoint, PeriodicTask>::iterator;
+  using Task = Task<Clock>;
+  using Iter = typename std::multimap<TimePoint, Task>::iterator;
 public:
   Scheduler()
-    : stop_(false), delay_wake_up_thread_(0), cvs_(ThreadNumber) {
-    for (size_t i = 1; i <= ThreadNumber; ++i) {
+    : stop_(false), delay_wake_up_thread_(ThreadNumber), cvs_(ThreadNumber) {
+    for (size_t i = 0; i != ThreadNumber; ++i) {
       threads_.emplace_back([i, this]{
         std::unique_lock<std::mutex> u_lock{mtx_};
         while (true) {
           if (stop_) break;
-          if (tasks_.empty() || delay_wake_up_thread_ != threads_.size()) {
+          // no task or there is already a thread waiting to delay
+          if (tasks_.empty() || delay_wake_up_thread_ != ThreadNumber) {
+            // put this thread into waiting order
             orders_.put(i);
             cvs_[i].wait(u_lock);
+            // remove the thread from waiting order on wake up
             orders_.remove(i);
           } else {
             auto && execute_time = tasks_.begin()->first;
             if (execute_time <= Clock::now()) {
               auto map_node = tasks_.extract(tasks_.begin());
+              // there are also tasks and waiting thread
               if (!tasks_.empty() && !orders_.empty())
                 cvs_[orders_.get()].notify_one();
-              auto& task = map_node.mapped();
+              auto && task = map_node.mapped();
               task(map_node, tasks_, u_lock);
             } else {
+              // wait for delay task
               orders_.put(i);
               delay_wake_up_thread_ = i;
               cvs_[i].wait_until(u_lock, execute_time);
-              delay_wake_up_thread_ = threads_.size();
+              delay_wake_up_thread_ = ThreadNumber;
               orders_.remove(i);
             }
           }
@@ -137,24 +142,30 @@ public:
   }
 
   template<typename F>
-  auto execute(F&& task,
-               const TimePoint& execute_time,
-               const Duration& period = Duration::zero(),
-               int times = 1) {
-    auto end_time = task.getEndTime(execute_time);
-    size_t index;
+  auto execute(F&& task, const TimePoint& execute_time,
+                const Duration& period, int times) {
+    size_t wake_up_thread;
+    Iter iter;
     {
       std::lock_guard<std::mutex> guard{mtx_};
-      auto iter = tasks_.emplace(execute_time, std::move(task));
+      iter = tasks_.emplace(execute_time, std::forward<F>(task));
+      // all threads are working
       if (orders_.empty())
-        index = cvs_.size();
-      else if (delay_wake_up_thread_ == cvs_.size())
-        index = orders_.get();
+        wake_up_thread = ThreadNumber;
+      // no thread waiting for delay task
+      else if (delay_wake_up_thread_ == ThreadNumber)
+        wake_up_thread = orders_.get();
+      // there is a thread waiting for delay task
       else
-        index = delay_wake_up_thread_;
+        wake_up_thread = delay_wake_up_thread_;
     }
-    if (index != cvs_.size())
-      cvs_[index].notify_one();
+    if (wake_up_thread != ThreadNumber)
+      cvs_[wake_up_thread].notify_one();
+    return iter;
+  }
+
+  void cancel(Iter iter) {
+    auto end_time = task.getEndTime(execute_time);
     return [callable = true, end_time, iter, this] () mutable {
       if (callable == false) return;
       std::unique_lock<std::mutex> u_lock{mtx_};
@@ -169,6 +180,7 @@ public:
       callable = false;
 
     };
+
   }
 
 private:
@@ -177,26 +189,27 @@ private:
   std::mutex mtx_;
   std::vector<std::condition_variable> cvs_;
   std::vector<std::thread> threads_;
-  std::multimap<TimePoint, PeriodicTask> tasks_;
+  std::multimap<TimePoint, Task> tasks_;
   HashListQueue<size_t> orders_;
 };
 
-template<typename Clock>
+template<typename Clock, size_t ThreadNumber, typename Iter>
 class TimerHandle : Noncopyable {
+  using Scheduler = Scheduler<Clock, ThreadNumber>;
   using TimePoint = typename Clock::time_point;
   using Duration = typename Clock::duration;
 public:
-  TimerHandle(std::function<void()> task,
-      const TimePoint& execute_time,
-      const Duration& period,
-      int times)
+  TimerHandle(Scheduler& scheduler, Iter iter)
+    : scheduler_(scheduler), task_iter_(iter) { }
+
   void cancel() {
+    scheduler_.cancel(task_iter_);
   }
   void reset();
 
 private:
-  std::mutex& mtx_;
-  std::multimap<TimePoint, PeriodicTask<Clock>>& tasks_;
+  Scheduler& scheduler_;
+  Iter task_iter_;
 };
 
 class Channel : Noncopyable {
@@ -360,12 +373,13 @@ public:
     return detail::IOHandle<EventListSize>(fd, epoller_);
   }
 
-  detail::TimerHandle<Clock> timer(std::function<void()> task,
+  template<typename F>
+  detail::TimerHandle<Clock> timer(F&& task,
           const TimePoint& execute_time = Clock::now(),
           const Duration& period = Duration::zero(),
           int times = 1) {
     return detail::TimerHandle<Clock>
-      (std::move(task), execute_time, period, times);
+      (std::forward<F>(task), execute_time, period, times);
   }
 
 private:
