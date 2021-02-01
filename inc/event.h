@@ -165,22 +165,14 @@ public:
   }
 
   void cancel(Iter iter) {
-    auto end_time = task.getEndTime(execute_time);
-    return [callable = true, end_time, iter, this] () mutable {
-      if (callable == false) return;
-      std::unique_lock<std::mutex> u_lock{mtx_};
-      if (end_time < Clock::now()) return;
-      size_t index = delay_wake_up_thread_;
-      bool need_notify = (iter == tasks_.begin())
-                        && (index != cvs_.size());
-      tasks_.erase(iter);
-      u_lock.unlock();
-      if (need_notify)
-        cvs_[index].notify_one();
-      callable = false;
-
-    };
-
+    std::unique_lock<std::mutex> u_lock{mtx_};
+    size_t i = delay_wake_up_thread_;
+    // if cancel the task of the thread which is waiting for delay
+    bool need_notify = (iter == tasks_.begin()) && (i != ThreadNumber);
+    tasks_.erase(iter);
+    u_lock.unlock();
+    if (need_notify)
+      cvs_[i].notify_one();
   }
 
 private:
@@ -193,23 +185,29 @@ private:
   HashListQueue<size_t> orders_;
 };
 
-template<typename Clock, size_t ThreadNumber, typename Iter>
+template<typename Clock, size_t ThreadNumber>
 class TimerHandle : Noncopyable {
   using Scheduler = Scheduler<Clock, ThreadNumber>;
   using TimePoint = typename Clock::time_point;
-  using Duration = typename Clock::duration;
+  using Iter = typename std::multimap<TimePoint, Task<Clock>>::iterator;
 public:
   TimerHandle(Scheduler& scheduler, Iter iter)
-    : scheduler_(scheduler), task_iter_(iter) { }
+    : scheduler_(scheduler), task_iter_(iter),
+      end_time_(iter->second.getEndTime(iter->first)){ }
 
   void cancel() {
+    if (done()) return;
     scheduler_.cancel(task_iter_);
+    end_time_ = Clock::now();
   }
-  void reset();
+  void done() {
+    return end_time_ <= Clock::now();
+  }
 
 private:
   Scheduler& scheduler_;
   Iter task_iter_;
+  TimePoint end_time_;
 };
 
 class Channel : Noncopyable {
@@ -374,13 +372,16 @@ public:
   }
 
   template<typename F>
-  detail::TimerHandle<Clock> timer(F&& task,
+  detail::TimerHandle<Clock, ThreadNumber> timer(F&& task,
           const TimePoint& execute_time = Clock::now(),
           const Duration& period = Duration::zero(),
           int times = 1) {
-    return detail::TimerHandle<Clock>
+    return detail::TimerHandle<Clock, ThreadNumber>
       (std::forward<F>(task), execute_time, period, times);
   }
+
+  template<typename F>
+  detail::SignalHandle signal(F)
 
 private:
   bool stop_;
