@@ -141,26 +141,31 @@ public:
       item.join();
   }
 
+  template<typename Iter>
+  void submit(Iter begin, Iter end) {
+    size_t wake_up_thread;
+    {
+      std::lock_guard<std::mutex> guard{mtx_};
+      std::for_each(begin, end, [this](auto && f) {
+        tasks_.emplace(Clock::now(), f);
+      });
+      wake_up_thread = getWaitingThread();
+    }
+    wakeUpThread(wake_up_thread);
+  }
+
   template<typename F>
   auto execute(F&& task, const TimePoint& execute_time,
                 const Duration& period, int times) {
     size_t wake_up_thread;
+    // save the iterator to cancel the task
     Iter iter;
     {
       std::lock_guard<std::mutex> guard{mtx_};
       iter = tasks_.emplace(execute_time, std::forward<F>(task));
-      // all threads are working
-      if (orders_.empty())
-        wake_up_thread = ThreadNumber;
-      // no thread waiting for delay task
-      else if (delay_wake_up_thread_ == ThreadNumber)
-        wake_up_thread = orders_.get();
-      // there is a thread waiting for delay task
-      else
-        wake_up_thread = delay_wake_up_thread_;
+      wake_up_thread = getWaitingThread();
     }
-    if (wake_up_thread != ThreadNumber)
-      cvs_[wake_up_thread].notify_one();
+    wakeUpThread(wake_up_thread);
     return iter;
   }
 
@@ -176,6 +181,25 @@ public:
   }
 
 private:
+  // need to be under mutex
+  size_t getWaitingThread() {
+    // all threads are working
+    if (orders_.empty())
+      return ThreadNumber;
+    // no thread waiting for delay task
+    else if (delay_wake_up_thread_ == ThreadNumber)
+      return orders_.get();
+    // there is a thread waiting for delay task
+    else
+      return delay_wake_up_thread_;
+  }
+
+  // don't need to be under mutex
+  void wakeUpThread(size_t wake_up_thread) {
+    if (wake_up_thread != ThreadNumber)
+      cvs_[wake_up_thread].notify_one();
+  }
+
   bool stop_;
   size_t delay_wake_up_thread_;
   std::mutex mtx_;
@@ -208,6 +232,24 @@ private:
   Scheduler& scheduler_;
   Iter task_iter_;
   TimePoint end_time_;
+};
+
+template<typename Scheduler>
+class SignalHandle : Noncopyable {
+public:
+  template<typename... F>
+  SignalHandle(Scheduler& scheduler, F&& ... callbacks)
+    : scheduler_(scheduler) {
+    (..., callbacks_.push_back(std::forward<F>(callbacks)));
+  }
+
+  void operator()() const {
+    scheduler_.submit(callbacks_.cbegin(), callbacks_.cend());
+  }
+
+private:
+  Scheduler& scheduler_;
+  std::vector<std::function<void()>> callbacks_;
 };
 
 class Channel : Noncopyable {
@@ -280,10 +322,10 @@ public:
     }
   }
 
-  void setTimeout(int timeout) {
+  void run() {
     // get the number of ready events
     int ready_events_number = ::epoll_wait(epfd_, events_.data(),
-        static_cast<int>(events_.size()), timeout);
+        static_cast<int>(events_.size()), -1);
     ASSERT(ready_events_number != -1);
 
     // really have events to deal with
@@ -318,44 +360,50 @@ private:
 
 template<size_t EventListSize>
 class IOHandle : Noncopyable {
-  using Epoller = Epoller<EventListSize>;
 public:
-  IOHandle(int fd, Epoller& epoller) : fd_(fd), epoller_(epoller) { }
+  IOHandle(int fd, Epoller<EventListSize>& epoller) : fd_(fd), epoller_(epoller) { }
 
-  void open(IO flag) {
-    if (isEpollEvent(flag)) {
+  template<IO flag> void open() {
+    if constexpr (isEpollEvent(flag)) {
       channel_.setEvents(static_cast<int>(flag));
       epoller_.monitor(fd_, channel_);
     }
   }
-  void close(IO flag) {
-    if (isEpollEvent(flag)) {
+  template<IO flag> void close() {
+    if constexpr (isEpollEvent(flag)) {
       channel_.unsetEvents(static_cast<int>(flag));
       epoller_.monitor(fd_, channel_);
     }
   }
-  void check(IO flag) {
-    if (isEpollEvent(flag))
+  template<IO flag> void check() {
+    if constexpr (isEpollEvent(flag))
       channel_.checkEvents(static_cast<int>(flag));
   }
-  void set(IO flag, std::function<void()> cb) {
-    switch (flag) {
-      case IO::kRead : channel_.setReadCallback(std::move(cb)); break;
-      case IO::kWrite : channel_.setWriteCallback(std::move(cb)); break;
-      case IO::kError : channel_.setErrorCallback(std::move(cb)); break;
-      case IO::kClose : channel_.setCloseCallback(std::move(cb)); break;
-      default : break;
-    }
+
+  // dispatch different kinds of callbacks
+  template<IO flag> void set(std::function<void()> cb) { }
+
+  template<> void set<IO::kRead>(std::function<void()> cb) {
+    channel_.setReadCallback(std::move(cb));
+  }
+  template<> void set<IO::kWrite>(std::function<void()> cb) {
+    channel_.setWriteCallback(std::move(cb));
+  }
+  template<> void set<IO::kError>(std::function<void()> cb) {
+    channel_.setErrorCallback(std::move(cb));
+  }
+  template<> void set<IO::kClose>(std::function<void()> cb) {
+    channel_.setCloseCallback(std::move(cb));
   }
 
 private:
-  bool isEpollEvent(IO flag) {
+  constexpr bool isEpollEvent(IO flag) {
     return !(flag == IO::kError || flag == IO::kClose);
   }
 
   int fd_;
   Channel channel_;
-  Epoller& epoller_;
+  Epoller<EventListSize>& epoller_;
 };
 
 } // namespace detail
@@ -364,29 +412,38 @@ template<typename Clock, size_t ThreadNumber, size_t EventListSize>
 class Processor : detail::Noncopyable {
   using TimePoint = typename Clock::time_point;
   using Duration = typename Clock::duration;
+  using Epoller = detail::Epoller<EventListSize>;
+  using Scheduler = detail::Scheduler<Clock, ThreadNumber>;
 public:
+  using IOhandle = detail::IOHandle<EventListSize>;
+  using TimerHandle = detail::TimerHandle<Clock, ThreadNumber>;
+  using SignalHandle = detail::SignalHandle<Scheduler>;
+
   Processor() {}
 
-  detail::IOHandle<EventListSize> io(int fd) {
-    return detail::IOHandle<EventListSize>(fd, epoller_);
+  auto io(int fd) {
+    return detail::IOHandle(fd, epoller_);
   }
 
   template<typename F>
-  detail::TimerHandle<Clock, ThreadNumber> timer(F&& task,
+  auto timer(F&& task,
           const TimePoint& execute_time = Clock::now(),
           const Duration& period = Duration::zero(),
           int times = 1) {
-    return detail::TimerHandle<Clock, ThreadNumber>
-      (std::forward<F>(task), execute_time, period, times);
+    auto iter = scheduler_.execute(
+        std::forward<F>(task), execute_time, period, times);
+    return detail::TimerHandle(scheduler_, iter);
   }
 
-  template<typename F>
-  detail::SignalHandle signal(F)
+  template<typename... F>
+  auto signal(F&& ... callbacks) {
+    return detail::SignalHandle(scheduler_, std::forward<F>(callbacks)...);
+  }
 
 private:
   bool stop_;
-  detail::Epoller<EventListSize> epoller_;
-  detail::Scheduler<Clock, ThreadNumber> scheduler_;
+  Scheduler scheduler_;
+  Epoller epoller_;
 };
 
 } // namespace hearten
