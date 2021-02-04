@@ -3,6 +3,7 @@
 
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <cstring>
 #include <vector>
 #include <unordered_set>
@@ -18,6 +19,7 @@
 
 namespace hearten {
 
+// for IOHandle
 enum class IO : int {
   // for epoll event and callback
   kRead = EPOLLIN | EPOLLPRI,
@@ -32,6 +34,7 @@ enum class IO : int {
 
 namespace detail {
 
+// speed up the queue
 template<typename T>
 class HashListQueue {
 public:
@@ -55,26 +58,27 @@ private:
 
 template<typename Clock>
 class Task {
-  using Period = typename Clock::duration;
-  using TimePoint = typename Clock::time_point;
 public:
   template<typename T>
-  Task(T&& task, const Period& period, int times)
+  Task(T&& task, const typename Clock::duration& period, int times)
     : task_(std::forward<T>(task)), period_(period), times_(times) { }
 
   template<typename T, typename C, typename U>
-  void operator()(T&& map_node, C& container, U& u_lock) {
+  void operator()(T&& map_node, C& container,
+      std::unique_lock<std::mutex>& u_lock) {
+    // need to execute
     if (--times_ >= 0) {
+      // there are execution times left
       if (times_ != 0) {
         map_node.key() += period_;
-        container.insert(std::move(map_node));
+        container.insert(std::forward<T>(map_node));
       }
       u_lock.unlock();
       task_();
       u_lock.lock();
     }
   }
-  TimePoint getEndTime(const TimePoint& execute_time) const {
+  auto getEndTime(const typename Clock::time_point& execute_time) const {
     return execute_time + period_ * times_;
   }
 
@@ -83,7 +87,7 @@ public:
 
 private:
   std::function<void()> task_;
-  Period period_;
+  typename Clock::duration period_;
   int times_;
 };
 
@@ -95,7 +99,20 @@ class Scheduler : Noncopyable {
   using Iter = typename std::multimap<TimePoint, Task>::iterator;
 public:
   Scheduler()
-    : stop_(false), delay_wake_up_thread_(ThreadNumber), cvs_(ThreadNumber) {
+    : stop_(true),
+      delay_wake_up_thread_(ThreadNumber),
+      cvs_(ThreadNumber) { }
+
+  ~Scheduler() {
+    closeAllThreads();
+  }
+
+  void start() {
+    {
+      std::lock_guard<std::mutex> guard{mtx_};
+      if (!stop_) return;
+      stop_ = false;
+    }
     for (size_t i = 0; i != ThreadNumber; ++i) {
       threads_.emplace_back([i, this]{
         std::unique_lock<std::mutex> u_lock{mtx_};
@@ -130,15 +147,10 @@ public:
       });
     }
   }
-  ~Scheduler() {
-    {
-      std::lock_guard<std::mutex> guard{mtx_};
-      stop_ = true;
-    }
-    for (auto && item : cvs_)
-      item.notify_one();
-    for (auto && item : threads_)
-      item.join();
+  void stop() {
+    closeAllThreads();
+    threads_.clear();
+    tasks_.clear();
   }
 
   template<typename Iter>
@@ -198,6 +210,18 @@ private:
   void wakeUpThread(size_t wake_up_thread) {
     if (wake_up_thread != ThreadNumber)
       cvs_[wake_up_thread].notify_one();
+  }
+
+  void closeAllThreads() {
+    {
+      std::lock_guard<std::mutex> guard{mtx_};
+      if (stop_) return;
+      stop_ = true;
+    }
+    for (auto && item : cvs_)
+      item.notify_one();
+    for (auto && item : threads_)
+      item.join();
   }
 
   bool stop_;
@@ -297,6 +321,7 @@ class Epoller : Noncopyable {
 public:
   Epoller()
     : epfd_(::epoll_create1(EPOLL_CLOEXEC)),
+      wakeup_fd_(-1),
       events_(EventListSize) {
     ASSERT(epfd_ != -1);
   }
@@ -322,29 +347,45 @@ public:
     }
   }
 
-  void run() {
-    // get the number of ready events
-    int ready_events_number = ::epoll_wait(epfd_, events_.data(),
-        static_cast<int>(events_.size()), -1);
-    ASSERT(ready_events_number != -1);
+  void epoll() {
+    if (wakeup_fd_ != -1) return;
+    setWakeupConfig();
+    while (true) {
+      // get the number of ready events
+      int ready_events_number = ::epoll_wait(epfd_, events_.data(),
+          static_cast<int>(events_.size()), -1);
+      ASSERT(ready_events_number != -1);
 
-    // really have events to deal with
-    if (size_t n = ready_events_number; n > 0) {
-      ASSERT(n <= events_.size());
-      // execute events callback
-      for (int i = 0; i < n; ++i) {
-        auto channel = static_cast<Channel*>(events_[i].data.ptr);
-        channel->handleEvent(events_[i].events);
+      // really have events to deal with
+      if (size_t n = ready_events_number; n > 0) {
+        ASSERT(n <= events_.size());
+        // execute events callback
+        for (int i = 0; i < n; ++i) {
+          auto channel = static_cast<Channel*>(events_[i].data.ptr);
+          // check wakeup channel
+          if (channel == &wakeup_channel_) {
+            unsetWakeupConfig();
+            return;
+          }
+          channel->handleEvent(events_[i].events);
+        }
+        // resizing the eventlist
+        if (n == events_.size())
+          events_.resize(events_.size() * 2);
+        else if (n <= events_.size() / 2 && events_.size() > EventListSize)
+          events_.resize(events_.size() / 2);
       }
-      // resizing the eventlist
-      if (n == events_.size())
-        events_.resize(events_.size() * 2);
-      else if (n <= events_.size() / 2 && events_.size() > EventListSize)
-        events_.resize(events_.size() / 2);
     }
   }
 
+  void wakeup() {
+    if (wakeup_fd_ == -1) return;
+    uint64_t data = 1;
+    ASSERT(sizeof(data) == write(wakeup_fd_, &data, sizeof(data)));
+  }
+
 private:
+  // add(delete, modify) the events into epoll
   void updateEpollEvent(int operation, int fd, Channel& channel) {
     epoll_event ev;
     ::memset(&ev, 0, sizeof(ev));
@@ -353,7 +394,23 @@ private:
     ASSERT(::epoll_ctl(epfd_, operation, fd, &ev) == 0);
   }
 
+  void setWakeupConfig() {
+    wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    ASSERT(wakeup_fd_ != -1);
+    updateEpollEvent(EPOLL_CTL_ADD, wakeup_fd_,
+        wakeup_channel_.setEvents(static_cast<int>(IO::kRead)));
+  }
+
+  void unsetWakeupConfig() {
+    updateEpollEvent(EPOLL_CTL_DEL, wakeup_fd_,
+        wakeup_channel_.unsetEvents(static_cast<int>(IO::kRead)));
+    ASSERT(::close(wakeup_fd_) != -1);
+    wakeup_fd_ = -1;
+  }
+
   int epfd_;
+  int wakeup_fd_;
+  Channel wakeup_channel_;
   std::unordered_set<int> fds_;
   std::vector<epoll_event> events_;
 };
@@ -362,6 +419,10 @@ template<size_t EventListSize>
 class IOHandle : Noncopyable {
 public:
   IOHandle(int fd, Epoller<EventListSize>& epoller) : fd_(fd), epoller_(epoller) { }
+
+  ~IOHandle() {
+    close<IO::kAll>();
+  }
 
   template<IO flag> void open() {
     if constexpr (isEpollEvent(flag)) {
@@ -397,6 +458,7 @@ public:
   }
 
 private:
+  // distinguish epoll events from callbacks
   constexpr bool isEpollEvent(IO flag) {
     return !(flag == IO::kError || flag == IO::kClose);
   }
@@ -440,8 +502,16 @@ public:
     return detail::SignalHandle(scheduler_, std::forward<F>(callbacks)...);
   }
 
+  void run() {
+    scheduler_.start();
+    epoller_.epoll();
+  }
+  void shutdown() {
+    epoller_.wakeup();
+    scheduler_.stop();
+  }
+
 private:
-  bool stop_;
   Scheduler scheduler_;
   Epoller epoller_;
 };
